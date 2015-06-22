@@ -1,0 +1,183 @@
+<?php
+
+/**
+ * @file
+ * Defines hooks and functions for generating a PDF to a node file field.
+ */
+
+define('NODE_PDF_DEFAULT_TYPE', 'attorney');
+define('NODE_PDF_DEFAULT_FIELD', 'field_pdf');
+
+/**
+ * Implements hook_libraries_info().
+ *
+ * Registers the dompdf library.
+ */
+function node_pdf_libraries_info() {
+  $library['dompdf'] = array(
+    'name' => 'dompdf',
+    'vendor url' => 'https://github.com/dompdf/dompdf',
+    'download url' => 'https://github.com/dompdf/dompdf/releases',
+    'version callback' => 'node_pdf_libraries_version_callback',
+    'files' => array(
+      'php' => array(
+        'lib/html5lib/Parser.php',
+        'lib/php-font-lib/src/Fontlib/Autoloader.php',
+        'src/functions.inc.php',
+        'src/autoload.inc.php',
+      ),
+    ),
+  );
+
+  return $library;
+}
+
+/**
+ * Implements hook_theme().
+ *
+ * Defines a custom theme function.
+ */
+function node_pdf_theme() {
+  return array(
+    'node_pdf' => array(
+      'render element' => 'elements',
+      'template' => 'theme/node',
+    ),
+  );
+}
+
+/**
+ * Simple callback function to satisfy hook_libraries_info().
+ */
+function node_pdf_libraries_version_callback() {
+  return TRUE;
+}
+
+/**
+ * Implements hook_entity_info_alter().
+ *
+ * Define node_pdf node view mode.
+ */
+function node_pdf_entity_info_alter(&$entity_info) {
+  $entity_info['node']['view modes']['node_pdf'] = array(
+    'label' => t('Node PDF'),
+    'custom settings' => TRUE,
+  );
+}
+
+/**
+ * Implements hook_preprocess_node().
+ *
+ * Define a theme_hook_suggestion for node_pdf.
+ */
+function node_pdf_preprocess_node(&$vars) {
+  if ($vars['view_mode'] == 'node_pdf') {
+    $template = 'node__' . $vars['type'] . '__node_pdf';
+    if (!in_array($template, $vars['theme_hook_suggestions'])) {
+      $vars['theme_hook_suggestions'][] = $template;
+    }
+  }
+}
+
+/**
+ * Implements hook_node_presave().
+ *
+ * Generate a pdf for the given node if the node has been configured for it.
+ */
+function node_pdf_node_presave($node) {
+  $types = variable_get('node_pdf_types', array(NODE_PDF_DEFAULT_TYPE));
+
+  if (!in_array($node->type, $types)) {
+    return FALSE;
+  }
+
+  if (!($field = variable_get("node_pdf_{$node->type}_field", NODE_PDF_DEFAULT_FIELD))) {
+    return FALSE;
+  }
+
+  node_pdf_attach_pdf($node, $field);
+
+  return $node;
+}
+
+/**
+ * Adds a generated pdf to a node.
+ */
+function node_pdf_attach_pdf(&$node, $field) {
+  // Wrap node for better access.
+  $entity = entity_metadata_wrapper('node', $node);
+
+  // Load field info for node_pdf field.
+  $field_info = field_info_instance('node', $field, $entity->getBundle());
+
+  // Get and set a nice file name.
+  $name = drupal_clean_css_identifier(drupal_strtolower($entity->title->value()));
+  $destination = "node_pdf_{$node->nid}_{$name}.pdf";
+
+  // Make sure we save the file to the correct directory.
+  if (isset($field_info['settings']['file_directory'])) {
+    $destination = sprintf(
+      "%s/%s",
+      $field_info['settings']['file_directory'],
+      $destination
+    );
+  }
+
+  // Get a new node object.
+  $cloned_node = clone $node;
+  $cloned_node->in_preview = TRUE;
+
+  // Allow other modules to alter the node fields.
+  _field_invoke_multiple(
+    'load',
+    'node',
+    array($cloned_node->nid => $cloned_node)
+  );
+
+  // Let any field types/formatters load additional data needed for display.
+  $nodes = array($cloned_node->nid => $cloned_node);
+  field_attach_prepare_view('node', $nodes, 'node_pdf');
+
+  // Call node view for a renderable node array.
+  $view = @node_view($cloned_node, 'node_pdf');
+  // Pass that through our theme function.
+  $content = theme('node_pdf', $view);
+
+  // Node PDF reads "/" preceded file paths as relative to the host root.
+  // Remove all preceding slashes from relative image tags.
+  $regex = "/(<img[^>]*src=\")\//";
+  $content = preg_replace($regex, "$1", $content);
+
+  // Call our helper to generate the actual file and get a file entity.
+  $file = node_pdf_generate_pdf($content, "public://" . $destination);
+
+  // Set the file field to out new file.
+  $entity->{$field}->file->set($file);
+}
+
+/**
+ * Returns a file entity of a generated PDF.
+ */
+function node_pdf_generate_pdf($content, $filename) {
+  if (!($library = libraries_load('dompdf')) && !$library['loaded']) {
+    watchdog(
+      'node_pdf',
+      'An error loading the dompdf library occurred.',
+      array(),
+      WATCHDOG_ERROR
+    );
+    return;
+  }
+
+  $dompdf = new \Dompdf\Dompdf();
+
+  // Allow dompdf to fetch remote images.
+  $options = $dompdf->getOptions();
+  $options->setIsRemoteEnabled(TRUE);
+  $dompdf->setOptions($options);
+
+  $dompdf->loadHtml($content);
+  $dompdf->render();
+
+  return file_save_data($dompdf->output(), $filename, FILE_EXISTS_REPLACE);
+}

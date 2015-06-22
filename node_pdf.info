@@ -1,0 +1,4 @@
+project = Node PDF
+description = This module allows one to automatically generate a PDF to a node file field
+core = 7.x
+version = 7.x-1.x
